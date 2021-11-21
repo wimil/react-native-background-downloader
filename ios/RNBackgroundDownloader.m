@@ -27,6 +27,10 @@ static CompletionHandler storedCompletionHandler;
 
 RCT_EXPORT_MODULE();
 
+#if DEBUG
++(void) initialize {}
+#endif
+
 - (dispatch_queue_t)methodQueue
 {
     return dispatch_queue_create("com.eko.backgrounddownloader", DISPATCH_QUEUE_SERIAL);
@@ -62,9 +66,7 @@ RCT_EXPORT_MODULE();
         idToTaskMap = [[NSMutableDictionary alloc] init];
         idToResumeDataMap= [[NSMutableDictionary alloc] init];
         idToPercentMap = [[NSMutableDictionary alloc] init];
-        NSString *bundleIdentifier = [[NSBundle mainBundle] bundleIdentifier];
-        NSString *sessonIdentifier = [bundleIdentifier stringByAppendingString:@".backgrounddownloadtask"];
-        sessionConfig = [NSURLSessionConfiguration backgroundSessionConfigurationWithIdentifier:sessonIdentifier];
+        [self updateSessionConfig];
         progressReports = [[NSMutableDictionary alloc] init];
         lastProgressReport = [[NSDate alloc] init];
         sharedLock = [NSNumber numberWithInt:1];
@@ -76,6 +78,14 @@ RCT_EXPORT_MODULE();
     if (urlSession == nil) {
         urlSession = [NSURLSession sessionWithConfiguration:sessionConfig delegate:self delegateQueue:nil];
     }
+}
+
+- (void)updateSessionConfig {
+    NSNumber *timestamp = [NSNumber numberWithDouble:[[NSDate date] timeIntervalSince1970]];
+    NSString *bundleIdentifier = [[NSBundle mainBundle] bundleIdentifier];
+    NSString *stringToAppend = [@".backgrounddownloadtask_" stringByAppendingString:[timestamp stringValue]];
+    NSString *sessionIdentifier = [bundleIdentifier stringByAppendingString:stringToAppend];
+    sessionConfig = [NSURLSessionConfiguration backgroundSessionConfigurationWithIdentifier:sessionIdentifier];
 }
 
 - (void)removeTaskFromMap: (NSURLSessionTask *)task {
@@ -99,10 +109,28 @@ RCT_EXPORT_MODULE();
 
 + (void)setCompletionHandlerWithIdentifier: (NSString *)identifier completionHandler: (CompletionHandler)completionHandler {
     NSString *bundleIdentifier = [[NSBundle mainBundle] bundleIdentifier];
-    NSString *sessonIdentifier = [bundleIdentifier stringByAppendingString:@".backgrounddownloadtask"];
-    if ([sessonIdentifier isEqualToString:identifier]) {
+    NSString *sessionIdentifier = [bundleIdentifier stringByAppendingString:@".backgrounddownloadtask"];
+    if ([sessionIdentifier isEqualToString:identifier]) {
         storedCompletionHandler = completionHandler;
     }
+}
+
+- (NSError *)getServerError: (nonnull NSURLSessionDownloadTask *)downloadTask {
+    NSError *serverError;
+    NSInteger httpStatusCode = [((NSHTTPURLResponse *)downloadTask.response) statusCode];
+    if(httpStatusCode != 200) {
+        serverError = [NSError errorWithDomain:NSURLErrorDomain code:httpStatusCode userInfo:@{NSLocalizedDescriptionKey: [NSHTTPURLResponse localizedStringForStatusCode:httpStatusCode]}];
+    }
+    return serverError;
+}
+
+- (BOOL)saveDownloadedFile: (nonnull RNBGDTaskConfig *) taskConfig downloadURL:(nonnull NSURL *)location error:(NSError **)saveError {
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    NSURL *destURL = [NSURL fileURLWithPath:taskConfig.destination];
+    [fileManager createDirectoryAtURL:[destURL URLByDeletingLastPathComponent] withIntermediateDirectories:YES attributes:nil error:nil];
+    [fileManager removeItemAtURL:destURL error:nil];
+
+    return [fileManager moveItemAtURL:location toURL:destURL error:saveError];
 }
 
 
@@ -116,7 +144,6 @@ RCT_EXPORT_METHOD(download: (NSDictionary *) options) {
         NSLog(@"[RNBackgroundDownloader] - [Error] id, url and destination must be set");
         return;
     }
-    [self lazyInitSession];
     
     NSMutableURLRequest *request = [[NSMutableURLRequest alloc] initWithURL:[NSURL URLWithString:url]];
     if (headers != nil) {
@@ -126,6 +153,7 @@ RCT_EXPORT_METHOD(download: (NSDictionary *) options) {
     }
     
     @synchronized (sharedLock) {
+        [self lazyInitSession];
         NSURLSessionDownloadTask __strong *task = [urlSession downloadTaskWithRequest:request];
         RNBGDTaskConfig *taskConfig = [[RNBGDTaskConfig alloc] initWithDictionary: @{@"id": identifier, @"destination": destination}];
 
@@ -208,19 +236,17 @@ RCT_EXPORT_METHOD(checkForExistingDownloads: (RCTPromiseResolveBlock)resolve rej
 #pragma mark - NSURLSessionDownloadDelegate methods
 - (void)URLSession:(nonnull NSURLSession *)session downloadTask:(nonnull NSURLSessionDownloadTask *)downloadTask didFinishDownloadingToURL:(nonnull NSURL *)location {
     @synchronized (sharedLock) {
-        RNBGDTaskConfig *taskCofig = taskToConfigMap[@(downloadTask.taskIdentifier)];
-        if (taskCofig != nil) {
-            NSFileManager *fileManager = [NSFileManager defaultManager];
-            NSURL *destURL = [NSURL fileURLWithPath:taskCofig.destination];
-            [fileManager createDirectoryAtURL:[destURL URLByDeletingLastPathComponent] withIntermediateDirectories:YES attributes:nil error:nil];
-            [fileManager removeItemAtURL:destURL error:nil];
-            NSError *moveError;
-            BOOL moved = [fileManager moveItemAtURL:location toURL:destURL error:&moveError];
+        RNBGDTaskConfig *taskConfig = taskToConfigMap[@(downloadTask.taskIdentifier)];
+        if (taskConfig != nil) {
+            NSError *error = [self getServerError:downloadTask];
+            if (error == nil) {
+                [self saveDownloadedFile:taskConfig downloadURL:location error:&error];
+            }
             if (self.bridge) {
-                if (moved) {
-                    [self sendEventWithName:@"downloadComplete" body:@{@"id": taskCofig.id}];
+                if (error == nil) {
+                    [self sendEventWithName:@"downloadComplete" body:@{@"id": taskConfig.id}];
                 } else {
-                    [self sendEventWithName:@"downloadFailed" body:@{@"id": taskCofig.id, @"error": [moveError localizedDescription]}];
+                    [self sendEventWithName:@"downloadFailed" body:@{@"id": taskConfig.id, @"error": [error localizedDescription]}];
                 }
             }
             [self removeTaskFromMap:downloadTask];
@@ -233,11 +259,11 @@ RCT_EXPORT_METHOD(checkForExistingDownloads: (RCTPromiseResolveBlock)resolve rej
 
 - (void)URLSession:(NSURLSession *)session downloadTask:(NSURLSessionDownloadTask *)downloadTask didWriteData:(int64_t)bytesWritten totalBytesWritten:(int64_t)totalBytesWritten totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
     @synchronized (sharedLock) {
-        RNBGDTaskConfig *taskCofig = taskToConfigMap[@(downloadTask.taskIdentifier)];
-        if (taskCofig != nil) {
-            if (!taskCofig.reportedBegin) {
-                [self sendEventWithName:@"downloadBegin" body:@{@"id": taskCofig.id, @"expectedBytes": [NSNumber numberWithLongLong: totalBytesExpectedToWrite]}];
-                taskCofig.reportedBegin = YES;
+        RNBGDTaskConfig *taskConfig = taskToConfigMap[@(downloadTask.taskIdentifier)];
+        if (taskConfig != nil) {
+            if (!taskConfig.reportedBegin) {
+                [self sendEventWithName:@"downloadBegin" body:@{@"id": taskConfig.id, @"expectedBytes": [NSNumber numberWithLongLong: totalBytesExpectedToWrite]}];
+                taskConfig.reportedBegin = YES;
             }
             
             NSNumber *prevPercent = idToPercentMap[taskCofig.id];
@@ -261,10 +287,10 @@ RCT_EXPORT_METHOD(checkForExistingDownloads: (RCTPromiseResolveBlock)resolve rej
 
 - (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error {
     @synchronized (sharedLock) {
-        RNBGDTaskConfig *taskCofig = taskToConfigMap[@(task.taskIdentifier)];
-        if (error != nil && error.code != -999 && taskCofig != nil) {
+        RNBGDTaskConfig *taskConfig = taskToConfigMap[@(task.taskIdentifier)];
+        if (error != nil && error.code != -999 && taskConfig != nil) {
             if (self.bridge) {
-                [self sendEventWithName:@"downloadFailed" body:@{@"id": taskCofig.id, @"error": [error localizedDescription]}];
+                [self sendEventWithName:@"downloadFailed" body:@{@"id": taskConfig.id, @"error": [error localizedDescription]}];
             }
             [self removeTaskFromMap:task];
         }

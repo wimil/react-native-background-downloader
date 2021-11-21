@@ -9,9 +9,9 @@ Pod::Spec.new do |s|
   s.homepage     = package['repository']['url']
   s.license      = package['license']
   s.platform     = :ios, '7.0'
-  s.source       = { git: 'https://github.com/EkoLabs/react-native-background-downloader.git', tag: 'master' }
+  s.source       = { git: 'https://github.com/tavvfiq/react-native-background-downloader.git', tag: 'master' }
   s.source_files = 'ios/**/*.{h,m}'
   s.requires_arc = true
 
-  s.dependency 'React'
+  s.dependency 'React-Core'
 end
