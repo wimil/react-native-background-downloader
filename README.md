@@ -38,6 +38,14 @@ For anything **`< 0.60`** run the following link command
 
 `$ react-native link react-native-background-downloader`
 
+#### extra step for android
+add in android/build.gradle under repository scope
+```
+maven {
+    url("$rootDir/../node_modules/react-native-background-downloader/android/lib")
+}
+```
+
 ### Manual installation
 
 
